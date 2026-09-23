@@ -1,0 +1,11 @@
+﻿venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+deal_tracker.db
+deals.db
+*.png
+.git/
+.cache/
+.DS_Store
