@@ -225,6 +225,13 @@ async def init_db():
             )
         """)
 
+        # ── Performance Indexes ──────────────────────────────────────────────
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lph_pid_recorded ON listing_price_history(pid, recorded_at DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lenovo_ph_pid_recorded ON lenovo_price_history(product_code, recorded_at DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lp_discount ON listing_products(discount_pct DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lenovo_discount ON lenovo_products(save_percent DESC)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lenovo_instock ON lenovo_products(in_stock)")
+
         await db.commit()
 
 
@@ -283,7 +290,7 @@ async def get_all_products() -> list[dict]:
                            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY id DESC) as rn
                     FROM price_history
                     WHERE product_id IN ({placeholders})
-                ) WHERE rn <= 10
+                ) WHERE rn <= 60
                 ORDER BY product_id, checked_at ASC
                 """,
                 pids,
@@ -759,7 +766,7 @@ async def get_listing_products(listing_id: int, sort_by: str = "steepest") -> li
                            ROW_NUMBER() OVER (PARTITION BY pid ORDER BY id DESC) as rn
                     FROM listing_price_history
                     WHERE pid IN ({placeholders})
-                ) WHERE rn <= 6
+                ) WHERE rn <= 60
                 ORDER BY pid, recorded_at ASC
                 """,
                 pids,
@@ -783,6 +790,112 @@ async def get_listing_products(listing_id: int, sort_by: str = "steepest") -> li
 # ═══════════════════════════════════════════════════════════════════════════
 # Lenovo Outlet Tracker Operations
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+import math
+
+def floor1(val: float | None) -> float:
+    """Floor a float to 1 decimal place."""
+    if val is None:
+        return 0.0
+    try:
+        f = float(val)
+        return math.floor(f * 10.0) / 10.0
+    except Exception:
+        return 0.0
+
+GPU_DEAL_THRESHOLDS = {
+    "insane": {
+        "RTX 5090": 300000,
+        "RTX 5080": 200000,
+        "RTX 5070": 150000,
+        "RTX 5060": 85000,
+        "RTX 5050": 75000,
+        "RTX 4060": 70000,
+        "RTX 4050": 55000,
+        "RTX 5000 Ada": 350000,
+        "RTX 2000 Ada": 400000,
+    },
+    "great": {
+        "RTX 5080": 250000,
+        "RTX 5070": 180000,
+        "RTX 5060": 100000,
+        "RTX 5050": 90000,
+        "RTX 4060": 85000,
+        "RTX 4050": 65000,
+        "RTX 3060": 65000,
+        "RTX 3050": 55000,
+        "RTX 500 Ada": 80000,
+    }
+}
+
+def _classify_gpu_tier(gpu_str: str) -> str:
+    g = gpu_str.upper()
+    if "5090" in g: return "RTX 5090"
+    if "5080" in g: return "RTX 5080"
+    if "5070" in g: return "RTX 5070"
+    if "5060" in g: return "RTX 5060"
+    if "5050" in g: return "RTX 5050"
+    if "4090" in g: return "RTX 4090"
+    if "4080" in g: return "RTX 4080"
+    if "4070" in g: return "RTX 4070"
+    if "4060" in g: return "RTX 4060"
+    if "4050" in g: return "RTX 4050"
+    if "3060" in g: return "RTX 3060"
+    if "3050" in g: return "RTX 3050"
+    if "5000 ADA" in g: return "RTX 5000 Ada"
+    if "2000 ADA" in g: return "RTX 2000 Ada"
+    if "500 ADA" in g: return "RTX 500 Ada"
+    return ""
+
+def _evaluate_lenovo_deal(item: dict) -> tuple[bool, str, str]:
+    """
+    Evaluate if a Lenovo laptop qualifies as a deal for Telegram alert.
+    Lenovo outlet items at normal discounts (25-45%) on dedicated GPUs,
+    AMD Radeon, or ThinkPads are high-value deals.
+    Returns (is_deal, alert_reason, signal_type).
+    """
+    save_pct = float(item.get("save_percent", 0.0) or 0.0)
+    is_dedicated = int(item.get("is_dedicated_gpu", 0))
+    gpu_str = str(item.get("gpu", "")).upper()
+    series_str = str(item.get("series", "")).upper()
+    name_str = str(item.get("name", "")).upper()
+    ram_str = str(item.get("ram", "")).upper()
+    
+    save_floored = floor1(save_pct)
+    gpu_tier = _classify_gpu_tier(gpu_str)
+    current_price = float(item.get("current_price", 0.0) or 0.0)
+    gpu_short = item.get("gpu", "Dedicated GPU")
+    
+    if (gpu_tier and current_price < GPU_DEAL_THRESHOLDS["insane"].get(gpu_tier, -1)) or \
+       (is_dedicated and "32" in ram_str and current_price < 90000):
+        return True, f"🚨 INSANE DEAL: {gpu_short} @ ₹{current_price:,.0f}", "insane_deal"
+        
+    if (gpu_tier and current_price < GPU_DEAL_THRESHOLDS["great"].get(gpu_tier, -1)) or \
+       ("32" in ram_str and current_price < 65000):
+        return True, f"⚡ GREAT DEAL: {gpu_short} @ ₹{current_price:,.0f}", "great_deal"
+    
+    # 1. Super Banger (>= 45%)
+    if save_pct >= 45.0:
+        return True, f"🔥 Banger Deal: -{save_floored:.1f}% OFF", "banger"
+    
+    # 2. Dedicated GPU (RTX 30/40/50, Ada, Quadro, GTX) with >= 25% discount
+    if (is_dedicated or "RTX" in gpu_str or "ADA" in gpu_str or "QUADRO" in gpu_str or "GTX" in gpu_str) and save_pct >= 25.0:
+        return True, f"🎮 Dedicated GPU Deal ({gpu_short}): -{save_floored:.1f}% OFF", "gpu_deal"
+        
+    # 3. AMD Radeon laptops with >= 30% discount
+    if ("RADEON" in gpu_str or "RX " in gpu_str) and save_pct >= 30.0:
+        return True, f"⚡ AMD Radeon Deal: -{save_floored:.1f}% OFF", "lenovo_deal"
+        
+    # 4. Premium ThinkPads (X1, T-series, P-series, L-series) with >= 30% discount
+    if ("THINKPAD" in series_str or "THINKPAD" in name_str) and save_pct >= 30.0:
+        return True, f"💼 ThinkPad Deal: -{save_floored:.1f}% OFF", "lenovo_deal"
+        
+    # 5. General Lenovo Outlet laptops with solid discount >= 35%
+    if save_pct >= 35.0:
+        return True, f"🏷️ Lenovo Outlet Deal: -{save_floored:.1f}% OFF", "lenovo_deal"
+        
+    return False, "", ""
 
 async def upsert_lenovo_products(items: list[dict]) -> tuple[int, list[dict]]:
     """
@@ -841,11 +954,13 @@ async def upsert_lenovo_products(items: list[dict]) -> tuple[int, list[dict]]:
 
             row = existing_map.get(pcode)
 
+            is_deal, deal_reason, deal_signal = _evaluate_lenovo_deal(item)
+
             if not row:
-                if save_pct >= 50.0 and in_stock:
+                if is_deal and in_stock:
                     deal_obj = dict(item)
-                    deal_obj["alert_reason"] = f"🔥 Banger Deal: {save_pct:.0f}% OFF"
-                    deal_obj["signal_type"] = "banger"
+                    deal_obj["alert_reason"] = deal_reason
+                    deal_obj["signal_type"] = deal_signal
                     deals_to_alert.append(deal_obj)
 
                 inserts.append((
@@ -872,15 +987,15 @@ async def upsert_lenovo_products(items: list[dict]) -> tuple[int, list[dict]]:
                 alert_reason = ""
                 signal_type = ""
 
-                if save_pct >= 50.0 and in_stock:
+                if is_deal and in_stock:
                     if last_alerted_pct is None:
                         should_alert = True
-                        alert_reason = f"🔥 Banger Deal: {save_pct:.0f}% OFF"
-                        signal_type = "banger"
-                    elif save_pct > last_alerted_pct:
+                        alert_reason = deal_reason
+                        signal_type = deal_signal
+                    elif save_pct > (last_alerted_pct + 0.9):
                         should_alert = True
-                        alert_reason = f"🚀 Discount Increased: {last_alerted_pct:.0f}% ➔ {save_pct:.0f}% OFF"
-                        signal_type = "banger"
+                        alert_reason = f"🚀 Discount Increased: {floor1(last_alerted_pct):.1f}% ➔ {floor1(save_pct):.1f}% OFF"
+                        signal_type = deal_signal
                     elif last_alerted_price is not None and price < last_alerted_price:
                         diff = last_alerted_price - price
                         should_alert = True
@@ -940,8 +1055,24 @@ async def upsert_lenovo_products(items: list[dict]) -> tuple[int, list[dict]]:
                 history_inserts
             )
 
+        # ── Mark products no longer returned by the scraper as out of stock ──
+        scanned_pcodes = [item["product_code"] for item in items]
+        if scanned_pcodes:
+            placeholders = ",".join(["?"] * len(scanned_pcodes))
+            await db.execute(
+                f"""UPDATE lenovo_products 
+                   SET in_stock = 0 
+                   WHERE product_code NOT IN ({placeholders}) AND in_stock = 1""",
+                scanned_pcodes
+            )
+        else:
+            # If the scraper returned absolutely nothing, it might be an error, but if it truly returned []
+            # we should technically mark all as out of stock. Be careful here.
+            await db.execute("UPDATE lenovo_products SET in_stock = 0 WHERE in_stock = 1")
+
         await db.commit()
         return len(inserts) + len(updates), deals_to_alert
+
         
     finally:
         await db.close()
@@ -1040,7 +1171,7 @@ async def get_lenovo_products(
                            ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY id DESC) as rn
                     FROM lenovo_price_history
                     WHERE product_code IN ({placeholders})
-                ) WHERE rn <= 6
+                ) WHERE rn <= 60
                 ORDER BY product_code, recorded_at ASC
                 """,
                 pcodes,
@@ -1056,6 +1187,16 @@ async def get_lenovo_products(
 
             for p in products:
                 p["price_history"] = h_map.get(p["product_code"], [])
+                # Evaluate deals for UI badges
+                is_deal, deal_reason, signal_type = _evaluate_lenovo_deal(p)
+                if signal_type == "insane_deal":
+                    p["tier"] = "insane"
+                elif signal_type == "great_deal":
+                    p["tier"] = "great"
+                elif is_deal:
+                    p["tier"] = "good"
+                else:
+                    p["tier"] = "none"
 
         return products
     finally:
@@ -1115,54 +1256,83 @@ async def get_lenovo_stats() -> dict:
 
 
 async def get_all_deals(
-    sort_by: str = "latest_drop",
+    sort_by: str = "steepest",
     filter_type: str = "all",
     platform: str = "all",
     category: str = "all",
+    ram: str = "all",
+    gpu: str = "all",
     q: str = "",
-    limit: int = 120,
+    in_stock_only: bool = False,
+    limit: int = 200,
 ) -> dict:
     """
-    Fetch and aggregate all active deals across Lenovo Outlet, Flipkart categories,
-    IKEA furniture, and tracked products into a single normalized live stream.
-    Supports recency-aware sorting ('latest_drop', 'hot_score', 'steepest', etc.).
+    Fetch and aggregate all active deals into a single normalized stream.
+    Two metrics per product:
+      - discount_pct: MRP → current price discount
+      - steep_drop_pct: price drop vs 5-day stable price (mode)
+    Price history is NOT attached — fetched on demand via /api/deal-history.
     """
     from datetime import datetime, timezone
+    from collections import Counter
 
     now = datetime.now(timezone.utc)
     db = await get_db()
     deals = []
 
     try:
-        # 1. Lenovo Outlet Products
+        # ── Pre-compute 5-day price modes for steep drop calculation ──
+        recent_modes = {}
+
+        if platform in ("all", "flipkart", "ikea"):
+            hist_fk = await db.execute_fetchall("""
+                SELECT pid, effective_price
+                FROM listing_price_history
+                WHERE recorded_at >= datetime('now', '-5 days')
+            """)
+            temp_fk = {}
+            for h in hist_fk:
+                temp_fk.setdefault(h["pid"], []).append(h["effective_price"])
+            for pid_key, prices in temp_fk.items():
+                if prices:
+                    recent_modes[pid_key] = Counter(prices).most_common(1)[0][0]
+
         if platform in ("all", "lenovo"):
-            lenovo_rows = await db.execute_fetchall("""
+            hist_ln = await db.execute_fetchall("""
+                SELECT product_code as pid, price as effective_price
+                FROM lenovo_price_history
+                WHERE recorded_at >= datetime('now', '-5 days')
+            """)
+            temp_ln = {}
+            for h in hist_ln:
+                temp_ln.setdefault(h["pid"], []).append(h["effective_price"])
+            for pid_key, prices in temp_ln.items():
+                if prices:
+                    recent_modes[pid_key] = Counter(prices).most_common(1)[0][0]
+
+        # ── 1. Lenovo Outlet Products ──
+        if platform in ("all", "lenovo"):
+            lenovo_query = """
                 SELECT product_code, name, series, cpu, ram, ssd, gpu, vram, condition,
                        current_price, mrp, save_percent, save_amount, url, in_stock,
                        first_seen_at, last_scanned_at, last_alerted_at, is_dedicated_gpu
                 FROM lenovo_products
-                WHERE save_percent > 0 AND in_stock = 1
-            """)
+                WHERE save_percent > 0
+            """
+            if in_stock_only:
+                lenovo_query += " AND in_stock = 1"
+
+            lenovo_rows = await db.execute_fetchall(lenovo_query)
             for r in lenovo_rows:
                 curr = r["current_price"] or 0.0
                 orig = r["mrp"] or curr
-                disc = round(r["save_percent"] or 0.0, 1)
+                disc = floor1(r["save_percent"])
                 savings = round(r["save_amount"] or (orig - curr if orig > curr else 0.0))
-                ts_str = r["last_alerted_at"] or r["first_seen_at"] or r["last_scanned_at"]
 
-                age_hours = 999.0
-                if ts_str:
-                    try:
-                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        age_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
-                    except Exception:
-                        pass
-
-                is_fresh = age_hours <= 48.0 or bool(r["last_alerted_at"])
-                fresh_bonus = max(0.0, 40.0 - (age_hours * 1.5)) if is_fresh else 0.0
-                hot_score = round(disc * 1.2 + min(30.0, savings / 3000.0) + fresh_bonus, 1)
+                mode_price = recent_modes.get(r["product_code"])
+                steep_drop_pct = 0.0
+                if mode_price and mode_price > curr:
+                    steep_drop_pct = floor1(((mode_price - curr) / mode_price) * 100.0)
 
                 deals.append({
                     "id": f"lenovo_{r['product_code']}",
@@ -1172,27 +1342,22 @@ async def get_all_deals(
                     "category": "laptops",
                     "category_label": "Laptop",
                     "name": r["name"],
-                    "title": r["name"],
                     "current_price": curr,
                     "original_price": orig,
                     "discount_pct": disc,
                     "savings_amount": savings,
-                    "drop_timestamp": ts_str,
-                    "age_hours": round(age_hours, 1),
-                    "is_fresh": is_fresh,
-                    "hot_score": hot_score,
+                    "steep_drop_pct": steep_drop_pct,
+                    "steep_mode_price": mode_price or 0,
                     "url": r["url"],
                     "image_url": "",
-                    "in_stock": True,
                     "cpu": r["cpu"],
                     "ram": r["ram"],
                     "ssd": r["ssd"],
                     "gpu": r["gpu"],
-                    "vram": r["vram"] or "",
-                    "is_banger": disc >= 50.0,
+                    "last_updated": r["last_scanned_at"],
                 })
 
-        # 2. Harvester Listing Products (Flipkart & IKEA)
+        # ── 2. Harvester Listing Products (Flipkart & IKEA) ──
         listing_rows = await db.execute_fetchall("""
             SELECT lp.id, lp.listing_id, lp.pid, lp.name, lp.title, lp.url, lp.image_url,
                    lp.mrp, lp.regular_price, lp.wow_price, lp.effective_price, lp.previous_price,
@@ -1213,23 +1378,8 @@ async def get_all_deals(
             curr = r["effective_price"] or 0.0
             candidates = [p for p in (r["mrp"], r["regular_price"], r["previous_price"]) if p and p > curr]
             orig = max(candidates) if candidates else (r["mrp"] or r["regular_price"] or curr)
-            disc = round(r["discount_pct"] or (round(((orig - curr) / orig) * 100, 1) if orig > curr else 0.0), 1)
+            disc = floor1(r["discount_pct"] if r["discount_pct"] is not None else (floor1(((orig - curr) / orig) * 100.0) if orig > curr else 0.0))
             savings = round(orig - curr if orig > curr else 0.0)
-            ts_str = r["last_alerted_at"] or r["last_updated"]
-
-            age_hours = 999.0
-            if ts_str:
-                try:
-                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    age_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
-                except Exception:
-                    pass
-
-            is_fresh = (age_hours <= 48.0 and disc > 0) or bool(r["last_alerted_at"])
-            fresh_bonus = max(0.0, 40.0 - (age_hours * 1.5)) if is_fresh else 0.0
-            hot_score = round(disc * 1.2 + min(30.0, savings / 3000.0) + fresh_bonus, 1)
 
             cat = r["category"] or "general"
             cat_label = {
@@ -1240,6 +1390,11 @@ async def get_all_deals(
                 "sofas": "Sofa / Furniture",
             }.get(cat, cat.title())
 
+            mode_price = recent_modes.get(r["pid"])
+            steep_drop_pct = 0.0
+            if mode_price and mode_price > curr:
+                steep_drop_pct = floor1(((mode_price - curr) / mode_price) * 100.0)
+
             deals.append({
                 "id": f"listing_{r['pid']}",
                 "pid": r["pid"],
@@ -1248,56 +1403,58 @@ async def get_all_deals(
                 "category": cat,
                 "category_label": cat_label,
                 "name": r["name"] or r["title"],
-                "title": r["title"],
                 "current_price": curr,
                 "original_price": orig,
                 "discount_pct": disc,
                 "savings_amount": savings,
-                "drop_timestamp": ts_str,
-                "age_hours": round(age_hours, 1),
-                "is_fresh": is_fresh,
-                "hot_score": hot_score,
+                "steep_drop_pct": steep_drop_pct,
+                "steep_mode_price": mode_price or 0,
                 "url": r["url"],
                 "image_url": r["image_url"] or "",
-                "in_stock": True,
                 "cpu": r["cpu"],
                 "ram": r["ram"],
                 "ssd": r["ssd"],
                 "gpu": r["gpu"],
-                "vram": "",
-                "is_banger": disc >= 50.0,
+                "last_updated": r["last_updated"],
             })
 
-        # 3. Filtering
-        total_before_filter = len(deals)
-        fresh_count = sum(1 for d in deals if d["is_fresh"])
-        bangers_count = sum(1 for d in deals if d["is_banger"])
-
+        # ── 3. Filtering ──
         filtered = []
         q_lower = q.strip().lower()
         for d in deals:
             if category != "all" and d["category"] != category:
                 continue
-            if filter_type == "fresh_drops" and not d["is_fresh"]:
-                continue
-            if filter_type == "bangers" and not d["is_banger"]:
-                continue
-            if filter_type == "in_stock" and not d["in_stock"]:
-                continue
+
+            # Specs Filters
+            d_ram = (d.get("ram") or "").lower()
+            if ram != "all":
+                if ram == "32gb" and not any(k in d_ram for k in ["32gb", "32 gb", "64gb", "64 gb"]):
+                    continue
+                elif ram != "32gb" and ram.replace("gb", " gb") not in d_ram and ram not in d_ram:
+                    continue
+
+            d_gpu = (d.get("gpu") or "").lower()
+            if gpu != "all":
+                if gpu == "rtx_30" and not any(k in d_gpu for k in ["rtx 30", "rtx30", "3050", "3060", "3070", "3080"]):
+                    continue
+                elif gpu == "rtx_40" and not any(k in d_gpu for k in ["rtx 40", "rtx40", "4050", "4060", "4070", "4080", "4090"]):
+                    continue
+                elif gpu == "rtx_50" and not any(k in d_gpu for k in ["rtx 50", "rtx50", "5060", "5070", "5080", "5090"]):
+                    continue
+                elif gpu == "amd" and not any(k in d_gpu for k in ["radeon", "rx ", "rx6", "rx7"]):
+                    continue
+
             if q_lower:
-                haystack = f"{d['name']} {d['title']} {d['category_label']} {d['platform_label']} {d.get('cpu', '')} {d.get('ram', '')} {d.get('ssd', '')} {d.get('gpu', '')}".lower()
+                haystack = f"{d['name']} {d['category_label']} {d['platform_label']} {d.get('cpu', '')} {d.get('ram', '')} {d.get('ssd', '')} {d.get('gpu', '')}".lower()
                 if q_lower not in haystack:
                     continue
             filtered.append(d)
 
-        # 4. Sorting
-        if sort_by == "latest_drop":
-            # Sort by is_fresh first, then lowest age_hours (most recent), then highest discount
-            filtered.sort(key=lambda x: (x["is_fresh"], -x["age_hours"], x["discount_pct"]), reverse=True)
-        elif sort_by == "hot_score":
-            filtered.sort(key=lambda x: x["hot_score"], reverse=True)
-        elif sort_by == "steepest":
-            filtered.sort(key=lambda x: (x["discount_pct"], x["savings_amount"]), reverse=True)
+        # ── 4. Sorting ──
+        if sort_by == "steepest":
+            filtered.sort(key=lambda x: (x["steep_drop_pct"], x["discount_pct"], x["savings_amount"]), reverse=True)
+        elif sort_by == "discount":
+            filtered.sort(key=lambda x: x["discount_pct"], reverse=True)
         elif sort_by == "price_asc":
             filtered.sort(key=lambda x: x["current_price"])
         elif sort_by == "price_desc":
@@ -1305,56 +1462,11 @@ async def get_all_deals(
         elif sort_by == "savings":
             filtered.sort(key=lambda x: x["savings_amount"], reverse=True)
         else:
-            filtered.sort(key=lambda x: (x["is_fresh"], -x["age_hours"], x["discount_pct"]), reverse=True)
-
-        sliced = filtered[:limit]
-
-        # 5. Batch-attach Price History to the sliced items for sparklines and trend modal
-        lenovo_codes = [d["pid"] for d in sliced if d["platform"] == "lenovo"]
-        listing_pids = [d["pid"] for d in sliced if d["platform"] in ("flipkart", "ikea")]
-
-        h_map = {}
-        if lenovo_codes:
-            placeholders = ",".join(["?"] * len(lenovo_codes))
-            h_rows = await db.execute_fetchall(f"""
-                SELECT product_code, price as current_price, recorded_at
-                FROM lenovo_price_history
-                WHERE product_code IN ({placeholders})
-                ORDER BY recorded_at ASC
-            """, lenovo_codes)
-            for hr in h_rows:
-                code = hr["product_code"]
-                h_map.setdefault(code, []).append({
-                    "effective_price": hr["current_price"],
-                    "recorded_at": hr["recorded_at"],
-                })
-
-        if listing_pids:
-            placeholders = ",".join(["?"] * len(listing_pids))
-            h_rows = await db.execute_fetchall(f"""
-                SELECT pid, regular_price, wow_price, effective_price, recorded_at
-                FROM listing_price_history
-                WHERE pid IN ({placeholders})
-                ORDER BY recorded_at ASC
-            """, listing_pids)
-            for hr in h_rows:
-                pid = hr["pid"]
-                h_map.setdefault(pid, []).append({
-                    "regular_price": hr["regular_price"],
-                    "wow_price": hr["wow_price"],
-                    "effective_price": hr["effective_price"],
-                    "recorded_at": hr["recorded_at"],
-                })
-
-        for d in sliced:
-            d["price_history"] = h_map.get(d["pid"], [])
+            filtered.sort(key=lambda x: (x["steep_drop_pct"], x["discount_pct"]), reverse=True)
 
         return {
             "total": len(filtered),
-            "total_all": total_before_filter,
-            "fresh_count": fresh_count,
-            "bangers_count": bangers_count,
-            "deals": sliced,
+            "deals": filtered[:limit],
         }
 
     finally:

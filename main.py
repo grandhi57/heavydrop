@@ -52,6 +52,33 @@ is_scanning = False
 is_lenovo_scanning = False
 LENOVO_CHECK_INTERVAL_SECONDS = int(os.getenv("LENOVO_CHECK_INTERVAL_SECONDS", "60"))
 
+# Real-time scan telemetry state
+scan_telemetry = {
+    "last_lenovo_scan_time": None,
+    "last_lenovo_count": 0,
+    "last_lenovo_deals_alerted": 0,
+    "last_harvester_scan_time": None,
+    "last_harvester_items_count": 0,
+    "recent_logs": [],
+}
+
+# Active escalations (product_code -> dict with deal info and reminder count)
+active_escalations = {}
+
+_last_update_id = 0
+
+def log_scan_event(source: str, message: str, status: str = "ok"):
+    from datetime import datetime
+    now_str = datetime.now().strftime("%H:%M:%S")
+    scan_telemetry["recent_logs"].insert(0, {
+        "time": now_str,
+        "source": source,
+        "message": message,
+        "status": status,
+    })
+    if len(scan_telemetry["recent_logs"]) > 30:
+        scan_telemetry["recent_logs"].pop()
+
 
 async def scheduled_lenovo_poll():
     """Background job: Poll Lenovo Outlet API every 60 seconds with rotating proxies."""
@@ -61,13 +88,21 @@ async def scheduled_lenovo_poll():
         return
     is_lenovo_scanning = True
     try:
+        from datetime import datetime
         logger.info("⚡ Starting scheduled Lenovo Outlet 1-minute scan...")
         laptops = await scraper.fetch_lenovo_outlet_laptops()
         if not laptops:
             logger.warning("No laptops returned from Lenovo outlet API.")
+            log_scan_event("Lenovo Outlet", "Poll completed: 0 laptops returned", "warning")
             return
 
         saved_count, deals_to_alert = await db.upsert_lenovo_products(laptops)
+        now_iso = datetime.now().isoformat()
+        scan_telemetry["last_lenovo_scan_time"] = now_iso
+        scan_telemetry["last_lenovo_count"] = saved_count
+        scan_telemetry["last_lenovo_deals_alerted"] = len(deals_to_alert)
+        log_scan_event("Lenovo Outlet", f"Harvested {saved_count} laptops ({len(deals_to_alert)} deals queued)")
+
         logger.info("💾 Lenovo scan saved %d laptops. Deals to alert: %d", saved_count, len(deals_to_alert))
 
         for deal in deals_to_alert:
@@ -79,6 +114,31 @@ async def scheduled_lenovo_poll():
                     platform="lenovo",
                 )
                 if sent:
+                    if signal_type == "insane_deal":
+                        import time
+                        active_escalations[deal["product_code"]] = {
+                            "start_time": time.time(),
+                            "reminders_sent": 0,
+                            "deal": deal
+                        }
+                        logger.info("🚨 INSANE DEAL QUEUED FOR ESCALATION: %s", deal["product_code"])
+                        # 📞 Fire CallMeBot voice call for insane deals
+                        try:
+                            gpu = deal.get("gpu") or ""
+                            price = deal.get("current_price", 0)
+                            name = deal.get("name", "laptop")
+                            call_text = (
+                                f"Insane deal alert! {name} with {gpu} at only "
+                                f"{price:,.0f} rupees. Open Telegram immediately to buy before it disappears!"
+                            )
+                            call_result = await notifier.trigger_voice_call(text=call_text)
+                            if call_result.get("success"):
+                                logger.info("📞 Voice call triggered for insane deal: %s", deal["product_code"])
+                            else:
+                                logger.warning("📞 Voice call failed: %s", call_result.get("error"))
+                        except Exception as call_err:
+                            logger.error("📞 Voice call exception: %s", call_err)
+
                     await db.record_lenovo_alert(
                         deal["product_code"],
                         deal["current_price"],
@@ -89,6 +149,7 @@ async def scheduled_lenovo_poll():
 
     except Exception as e:
         logger.error("Error during scheduled Lenovo Outlet scan: %s", e)
+        log_scan_event("Lenovo Outlet", f"Scan error: {e}", "error")
     finally:
         is_lenovo_scanning = False
 
@@ -101,14 +162,30 @@ async def scheduled_check_all():
         return
     is_scanning = True
     try:
+        from datetime import datetime
         logger.info("⏰ Scheduled check starting…")
+        log_scan_event("Harvester", "Category & single product check started")
         await _check_all_products()
         await _scan_all_listings()
+        now_iso = datetime.now().isoformat()
+        scan_telemetry["last_harvester_scan_time"] = now_iso
+        log_scan_event("Harvester", "Scheduled scan cycle completed")
         logger.info("✅ Scheduled check complete.")
     except Exception as e:
         logger.error("Error during scheduled check: %s", e)
+        log_scan_event("Harvester", f"Check error: {e}", "error")
     finally:
         is_scanning = False
+        from datetime import datetime, timedelta
+        next_run_time = datetime.now() + timedelta(minutes=CHECK_INTERVAL)
+        logger.info(f"💤 Resting for {CHECK_INTERVAL} minutes. Next scan scheduled at {next_run_time.strftime('%H:%M:%S')}")
+        scheduler.add_job(
+            scheduled_check_all,
+            "date",
+            run_date=next_run_time,
+            id="price_check",
+            replace_existing=True,
+        )
 
 
 async def _check_all_products():
@@ -199,16 +276,115 @@ async def scheduled_retry_failed_alerts():
         logger.error("Error during failed alert retry: %s", e)
 
 
+async def check_escalation_reminders():
+    """Background job: Send reminders for unacknowledged Tier 1 deals."""
+    import time
+    now = time.time()
+    
+    # Check every active escalation
+    for pid, esc in list(active_escalations.items()):
+        # Non-stop reminders every 1 second
+        elapsed = now - esc["start_time"]
+        reminders_sent = esc.get("reminders_sent", 0)
+        
+        # Calculate how many reminders should have been sent by now (1 reminder per second)
+        # Using a slight buffer (1.0) to ensure we don't spam too fast in one tick
+        target_reminders = int(elapsed / 1.0)
+        
+        if reminders_sent < target_reminders:
+            r_num = reminders_sent + 1
+            logger.info("⏰ Sending 1-second interval reminder %d for unacknowledged deal %s", r_num, pid)
+            try:
+                deal = esc["deal"]
+                msg = (
+                    f"⏰ <b>URGENT REMINDER {r_num}: DON'T MISS THIS!</b> ⏰\n\n"
+                    f"🔥 <b>{deal.get('name')}</b> is still unacknowledged at <b>₹{deal.get('current_price',0):,.0f}</b>.\n\n"
+                    f"🔗 <a href=\"{deal.get('url','')}\">Buy Now</a>\n"
+                )
+                # Use a unique cooldown key for each reminder
+                cooldown_key = f"rem_{r_num}_{pid}_{deal.get('current_price',0)}"
+                import notifier
+                # We pass the reminder message directly using the internal dispatcher
+                bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+                
+                if bot_token and chat_id:
+                    payload = {
+                        "chat_id": chat_id,
+                        "text": msg,
+                        "parse_mode": "HTML",
+                        "reply_markup": {
+                            "inline_keyboard": [[
+                                {"text": "✅ Acknowledge (Stop Pinging)", "callback_data": f"ack_{pid}"}
+                            ]]
+                        }
+                    }
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        await client.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload)
+                        
+                active_escalations[pid]["reminders_sent"] = r_num
+            except Exception as e:
+                logger.error("Failed to send reminder for %s: %s", pid, e)
+                
+        # Auto expire after 24 hours to prevent memory leaks if completely ignored
+        if elapsed > 24 * 60 * 60:
+            logger.info("Escalation for %s auto-expired after 24 hours", pid)
+            active_escalations.pop(pid, None)
+
+
+async def poll_telegram_updates():
+    """Background job: poll Telegram for /ack callbacks."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token or bot_token == "your_bot_token_here":
+        return
+        
+    global _last_update_id
+    try:
+        if '_last_update_id' not in globals():
+            _last_update_id = 0
+            
+        import httpx
+        url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+        params = {"offset": _last_update_id, "timeout": 5, "allowed_updates": ["callback_query"]}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    for update in data.get("result", []):
+                        _last_update_id = update["update_id"] + 1
+                        
+                        if "callback_query" in update:
+                            cb = update["callback_query"]
+                            cb_data = cb.get("data", "")
+                            
+                            if cb_data.startswith("ack_"):
+                                pid = cb_data[4:]
+                                if pid in active_escalations:
+                                    active_escalations.pop(pid)
+                                    logger.info("✅ Telegram User acknowledged deal %s. Escalation stopped.", pid)
+                                    
+                                    # Answer callback to remove loading state
+                                    cb_id = cb.get("id")
+                                    await client.post(
+                                        f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
+                                        json={"callback_query_id": cb_id, "text": "Deal Acknowledged! Escalation stopped."}
+                                    )
+    except Exception as e:
+        pass # Ignore minor polling errors
+
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
     logger.info("📦 Database initialized.")
 
+    from datetime import datetime, timedelta
     scheduler.add_job(
         scheduled_check_all,
-        "interval",
-        minutes=CHECK_INTERVAL,
+        "date",
+        run_date=datetime.now() + timedelta(seconds=15),
         id="price_check",
         replace_existing=True,
     )
@@ -234,6 +410,22 @@ async def lifespan(app: FastAPI):
         "interval",
         minutes=10,
         id="retry_failed_alerts",
+        replace_existing=True,
+    )
+    # Check for escalation reminders every 1 second
+    scheduler.add_job(
+        check_escalation_reminders,
+        "interval",
+        seconds=1,
+        id="check_escalation_reminders",
+        replace_existing=True,
+    )
+    # Poll Telegram for callbacks every 5 seconds
+    scheduler.add_job(
+        poll_telegram_updates,
+        "interval",
+        seconds=5,
+        id="poll_telegram_updates",
         replace_existing=True,
     )
     scheduler.start()
@@ -373,12 +565,15 @@ async def force_scan_listing(listing_id: int, scrolls: int = Query(default=25, g
 
 @app.get("/api/all-deals")
 async def get_all_deals_route(
-    sort_by: str = Query(default="latest_drop"),
+    sort_by: str = Query(default="steepest"),
     filter_type: str = Query(default="all"),
     platform: str = Query(default="all"),
     category: str = Query(default="all"),
+    ram: str = Query(default="all"),
+    gpu: str = Query(default="all"),
     q: str = Query(default=""),
-    limit: int = Query(default=120, le=300),
+    in_stock_only: bool = Query(default=False),
+    limit: int = Query(default=200, le=500),
 ):
     """Retrieve normalized live deal stream across all platforms & categories."""
     return await db.get_all_deals(
@@ -386,15 +581,52 @@ async def get_all_deals_route(
         filter_type=filter_type,
         platform=platform,
         category=category,
+        ram=ram,
+        gpu=gpu,
         q=q,
+        in_stock_only=in_stock_only,
         limit=limit,
     )
+
+
+@app.get("/api/deal-history/{pid:path}")
+async def get_deal_history(pid: str):
+    """Lazy-load price history for a single product (for trend modal)."""
+    conn = await db.get_db()
+    try:
+        # Try listing_price_history first (Flipkart/IKEA)
+        rows = await conn.execute_fetchall(
+            """SELECT effective_price, regular_price, wow_price, recorded_at
+               FROM listing_price_history WHERE pid = ? ORDER BY recorded_at ASC""",
+            (pid,),
+        )
+        if rows:
+            return [dict(r) for r in rows]
+
+        # Try lenovo_price_history
+        rows = await conn.execute_fetchall(
+            """SELECT price as effective_price, save_percent, recorded_at
+               FROM lenovo_price_history WHERE product_code = ? ORDER BY recorded_at ASC""",
+            (pid,),
+        )
+        if rows:
+            return [dict(r) for r in rows]
+
+        # Try single product tracker
+        rows = await conn.execute_fetchall(
+            """SELECT price as effective_price, checked_at as recorded_at
+               FROM price_history WHERE product_id = ? ORDER BY checked_at ASC""",
+            (pid,),
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
 
 
 @app.get("/api/listings/{listing_id}/products")
 async def get_listing_products_route(
     listing_id: int,
-    sort_by: str = Query(default="steepest", pattern="^(steepest|lowest_price|wow_only|newest|latest_drop)$"),
+    sort_by: str = Query(default="steepest", pattern="^(steepest|lowest_price|wow_only|newest|latest_drop|discount|savings|price_asc|price_desc)$"),
 ):
     """Retrieve all harvested laptops/products for a listing."""
     listing = await db.get_listing(listing_id)
@@ -409,7 +641,7 @@ async def get_listing_products_route(
     }
 
 
-async def _scan_single_listing(listing_id: int, max_scrolls: int = 25) -> dict:
+async def _scan_single_listing(listing_id: int, max_scrolls: int = 60) -> dict:
     """Core logic to run mobile virtual-scroll harvest on a listing."""
     listing = await db.get_listing(listing_id)
     if not listing:
@@ -661,6 +893,7 @@ async def api_status():
         "lenovo_next_check": lenovo_next,
         "lenovo_products_count": l_stats.get("total_count", 0),
         "lenovo_banger_deals_count": l_stats.get("banger_count", 0),
+        "telemetry": scan_telemetry,
     }
 
 
@@ -819,6 +1052,65 @@ async def get_lenovo_stats_route():
     stats["is_scanning"] = is_lenovo_scanning
     stats["interval_seconds"] = LENOVO_CHECK_INTERVAL_SECONDS
     return stats
+
+
+@app.post("/api/test-voice-call")
+async def test_voice_call():
+    """Trigger a test Telegram voice call via CallMeBot and test the escalation ping loop."""
+    # 1. Fire Voice Call
+    result = await notifier.trigger_voice_call(
+        text="This is a test call from your deal tracker. Voice call alerts are working correctly. You will receive calls like this when an insane deal is detected!"
+    )
+    
+    # 2. Inject a fake deal into active_escalations to test the reminder loop
+    import time
+    test_deal = {
+        "product_code": "TEST_DEAL",
+        "name": "TEST LAPTOP DEAL",
+        "current_price": 65000,
+        "url": "https://www.lenovo.com/in/outletin/en/p/test"
+    }
+    
+    active_escalations["TEST_DEAL"] = {
+        "start_time": time.time(),
+        "reminders_sent": 0,
+        "deal": test_deal
+    }
+    
+    # Also send the initial message with the ack button right now!
+    import httpx, os
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    msg = (
+        "🚨🚨🚨 <b>TEST INSANE DEAL ALERT</b> 🚨🚨🚨\n\n"
+        "🔥 <b>RTX 4060 Laptop @ ₹65,000</b>\n"
+        "💻 <b>Lenovo ThinkPad P16v Gen 2</b>\n"
+        "⚠️ <i>This is a TEST notification. If you do not click Acknowledge below, I will ping you every 15 seconds!</i>"
+    )
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "HTML",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "✅ Acknowledge (Stop Pinging)", "callback_data": "ack_TEST_DEAL"}
+            ]]
+        }
+    }
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload)
+
+    return result
+
+
+@app.get("/api/ack/{product_code}")
+async def ack_deal(product_code: str):
+    """Acknowledge a deal to stop escalation reminders."""
+    if product_code in active_escalations:
+        active_escalations.pop(product_code)
+        logger.info("✅ User acknowledged deal %s. Escalation stopped.", product_code)
+        return {"status": "success", "message": f"Deal {product_code} acknowledged"}
+    return {"status": "not_found", "message": "Deal not active or already acknowledged"}
 
 
 async def _check_single_product(product_id: int) -> dict:

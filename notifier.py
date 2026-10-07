@@ -18,8 +18,29 @@ logger = logging.getLogger(__name__)
 
 # Cooldown: don't re-alert for the same product within 6 hours
 _COOLDOWN_SECONDS = 6 * 60 * 60
+_COOLDOWN_FILE = "cooldowns.json"
 _last_alert_times: dict[str, float] = {}  # key -> timestamp
 
+def _load_cooldowns():
+    global _last_alert_times
+    import json, os
+    if os.path.exists(_COOLDOWN_FILE):
+        try:
+            with open(_COOLDOWN_FILE, "r") as f:
+                _last_alert_times = json.load(f)
+        except Exception:
+            _last_alert_times = {}
+
+def _save_cooldowns():
+    import json
+    try:
+        with open(_COOLDOWN_FILE, "w") as f:
+            json.dump(_last_alert_times, f)
+    except Exception:
+        pass
+
+# Initialize on load
+_load_cooldowns()
 
 def _is_on_cooldown(key: str) -> bool:
     """Check if an alert key is still on cooldown."""
@@ -32,6 +53,7 @@ def _is_on_cooldown(key: str) -> bool:
 def _set_cooldown(key: str) -> None:
     """Mark an alert key as recently alerted."""
     _last_alert_times[key] = time.time()
+    _save_cooldowns()
 
 
 async def send_price_alert(
@@ -230,9 +252,53 @@ async def send_lenovo_deal_alert(
     return await _dispatch_telegram(bot_token, chat_id, message, cooldown_key)
 
 
+async def trigger_voice_call(text: str = None) -> dict:
+    """
+    Trigger a Telegram voice call via CallMeBot.
+    The user must have started @CallMeBot_txtbot before this will work.
+    
+    CallMeBot API: http://api.callmebot.com/start.php?user=@username&text=MESSAGE&lang=en-IN-Standard-D&rpt=2
+    
+    Returns a dict with 'success' bool and 'error' or 'message'.
+    """
+    username = os.getenv("CALLMEBOT_TELEGRAM_USER", "").strip()
+    if not username:
+        return {"success": False, "error": "CALLMEBOT_TELEGRAM_USER not configured in .env"}
+
+    if not text:
+        text = (
+            "ALERT! Insane laptop deal detected by your deal tracker! "
+            "Open Telegram immediately to check the deal before it disappears!"
+        )
+
+    import urllib.parse
+    encoded_text = urllib.parse.quote(text)
+    api_url = (
+        f"http://api.callmebot.com/start.php"
+        f"?user=@{username}"
+        f"&text={encoded_text}"
+        f"&lang=en-IN-Standard-D"
+        f"&rpt=2"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(api_url)
+            if resp.status_code == 200:
+                logger.info("📞 CallMeBot voice call triggered for @%s", username)
+                return {"success": True, "message": f"Voice call triggered for @{username}"}
+            else:
+                logger.warning("📞 CallMeBot returned HTTP %d: %s", resp.status_code, resp.text[:200])
+                return {"success": False, "error": f"CallMeBot HTTP {resp.status_code}: {resp.text[:100]}"}
+    except Exception as e:
+        logger.error("📞 CallMeBot voice call failed: %s", e)
+        return {"success": False, "error": str(e)}
+
+
 async def _dispatch_telegram(
     bot_token: str, chat_id: str, message: str, cooldown_key: str,
     max_retries: int = 3,
+    reply_markup: dict = None,
 ) -> bool:
     """Internal helper to dispatch message to Telegram with exponential backoff retry."""
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -242,6 +308,8 @@ async def _dispatch_telegram(
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     import asyncio
     delays = [5, 15, 30]  # exponential backoff delays in seconds
@@ -321,12 +389,20 @@ def _build_unified_message(deal: dict, signal_type: str) -> str:
     if ref and ref > effective_price:
         was_str = f" (was ₹{ref:,.0f})"
     
+    import math
+    disc_floored = math.floor(float(discount_pct or 0.0) * 10.0) / 10.0
+    disc_str = f"{disc_floored:.1f}"
+
     signal_badges = {
-        "price_drop": f"🔻 <b>-{discount_pct:.0f}% DROP</b> | <b>{price_str}</b>{was_str}",
-        "banger": f"🔥 <b>-{discount_pct:.0f}% BANGER</b> | <b>{price_str}</b>{was_str}",
-        "discovery": f"🆕 <b>NEW DEAL: -{discount_pct:.0f}%</b> | <b>{price_str}</b>{was_str}",
+        "price_drop": f"🔻 <b>-{disc_str}% DROP</b> | <b>{price_str}</b>{was_str}",
+        "banger": f"🔥 <b>-{disc_str}% BANGER</b> | <b>{price_str}</b>{was_str}",
+        "gpu_deal": f"🎮 <b>-{disc_str}% GPU DEAL</b> | <b>{price_str}</b>{was_str}",
+        "lenovo_deal": f"⚡ <b>-{disc_str}% LENOVO DEAL</b> | <b>{price_str}</b>{was_str}",
+        "discovery": f"🆕 <b>NEW DEAL: -{disc_str}%</b> | <b>{price_str}</b>{was_str}",
         "all_time_low": f"📉 <b>ALL-TIME LOW</b> | <b>{price_str}</b>{was_str}",
         "target_hit": f"🎯 <b>TARGET HIT!</b> | <b>{price_str}</b>{was_str}",
+        "insane_deal": f"🚨 <b>INSANE DEAL</b> | <b>{price_str}</b>{was_str}",
+        "great_deal": f"⚡ <b>GREAT VALUE</b> | <b>{price_str}</b>{was_str}",
     }
     header = signal_badges.get(signal_type, f"🔔 <b>Deal Alert</b> | <b>{price_str}</b>")
     
@@ -380,10 +456,16 @@ def _build_unified_message(deal: dict, signal_type: str) -> str:
     # GPU/VRAM emphasis for Lenovo
     vram = deal.get("vram", "")
     is_dedicated = deal.get("is_dedicated_gpu", 0)
+    gpu_val = deal.get("gpu", "")
     gpu_line = ""
-    if deal.get("gpu") and is_dedicated and platform.lower() in ["lenovo", "lenovo outlet"]:
+    if gpu_val and platform.lower() in ["lenovo", "lenovo outlet"]:
         vram_str = f" ({vram})" if vram else ""
-        gpu_line = f"🎮 <b>GPU: {deal['gpu']}{vram_str} [DEDICATED]</b>\n"
+        if is_dedicated:
+            gpu_line = f"🎮 <b>GPU: {gpu_val}{vram_str} [DEDICATED]</b>\n"
+        elif "radeon" in gpu_val.lower():
+            gpu_line = f"⚡ <b>GPU: {gpu_val}{vram_str} [AMD RADEON]</b>\n"
+        else:
+            gpu_line = f"🖥️ <b>GPU: {gpu_val}{vram_str}</b>\n"
     
     specs_line = f"⚙️ {' • '.join(spec_parts)}\n" if spec_parts else ""
     
@@ -473,7 +555,17 @@ async def send_deal_alert(
     
     message = _build_unified_message(deal_enriched, signal_type)
     
-    sent = await _dispatch_telegram(bot_token, chat_id, message, cooldown_key)
+    reply_markup = None
+    if signal_type == "insane_deal":
+        reply_markup = {
+            "inline_keyboard": [[
+                {"text": "✅ Acknowledge (Stop Pinging)", "callback_data": f"ack_{pid}"}
+            ]]
+        }
+    
+    sent = await _dispatch_telegram(
+        bot_token, chat_id, message, cooldown_key, reply_markup=reply_markup
+    )
     
     # Log notification (async, best-effort)
     try:

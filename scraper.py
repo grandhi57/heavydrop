@@ -480,54 +480,9 @@ JS_MOBILE_PRODUCT_EXTRACTOR = """
         let regularPrice = null;
         let wowPrice = null;
 
-        // 1. WoW / Bank offer price
-        const allDivs = Array.from(card.querySelectorAll('div, span'));
-        for (const el of allDivs) {
-            const text = (el.innerText || '').trim();
-            const style = el.getAttribute('style') || '';
-            const isBlue = style.includes('22, 66, 185') || style.includes('22,66,185');
-
-            // Detect if this element represents an EMI installment breakdown (e.g. ₹7,332 x 6m or ₹7,332/month)
-            const parentText = (el.parentElement ? el.parentElement.innerText : '').toLowerCase();
-            const nextText = (el.nextElementSibling ? el.nextElementSibling.innerText : '').toLowerCase();
-            const selfText = text.toLowerCase();
-            const fullContext = selfText + ' ' + parentText + ' ' + nextText;
-
-            const isEmi = fullContext.includes('/month') || fullContext.includes('per month') ||
-                          fullContext.includes('/m ') || fullContext.includes('/m\\n') ||
-                          fullContext.includes('no cost emi') || fullContext.includes('standard emi') ||
-                          /\bx\s*\d+\s*m\b/i.test(fullContext);
-
-            // Monthly EMI is NOT a discounted WoW deal (it's paying the regular price over time).
-            // Skip any EMI monthly installment from being captured as the lump-sum WoW deal.
-            if (isEmi) {
-                continue;
-            }
-
-            if (isBlue && text.includes('₹')) {
-                let parsed = cleanPrice(text);
-                if (parsed) {
-                    wowPrice = parsed;
-                }
-            } else if (text.toLowerCase().includes('bank offer') || text.toLowerCase().includes('lowest price')) {
-                const parent = el.parentElement;
-                if (parent) {
-                    const priceNodes = parent.querySelectorAll('div, span');
-                    for (const pn of priceNodes) {
-                        const pnText = (pn.innerText || '').toLowerCase();
-                        if (pnText.includes('/month') || pnText.includes('per month') || pnText.includes('emi') || /\bx\s*\d+\s*m\b/i.test(pnText)) continue;
-                        if (pn !== el && pn.innerText && pn.innerText.includes('₹')) {
-                            let p = cleanPrice(pn.innerText);
-                            if (p && (!wowPrice || p < wowPrice)) {
-                                wowPrice = p;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. MRP (strikethrough)
+        const allDivs = Array.from(card.querySelectorAll('*'));
+        
+        // 1. MRP (strikethrough)
         const strikeEls = card.querySelectorAll('[style*="line-through"]');
         for (const s of strikeEls) {
             if (s.innerText && s.innerText.includes('₹')) {
@@ -539,29 +494,51 @@ JS_MOBILE_PRODUCT_EXTRACTOR = """
             }
         }
 
-        // 3. Regular Selling Price
+        // 2. Collect all valid standalone prices
+        let allPrices = [];
         for (const el of allDivs) {
+            const text = (el.innerText || '').trim();
+            if (!text.includes('₹') && !text.toLowerCase().includes('rs.')) continue;
+            // Prevent massive parent containers from throwing off context
+            if (text.length > 40) continue;
+            
             const style = el.getAttribute('style') || '';
             if (style.includes('line-through')) continue;
-            if (style.includes('22, 66, 185') || style.includes('22,66,185')) continue;
+            
+            const parsed = cleanPrice(text);
+            if (!parsed) continue;
+            if (parsed === mrp) continue;
 
-            // Only inspect leaf nodes to prevent concatenating sibling/child prices
-            if (el.children && el.children.length > 0) continue;
-
-            const text = (el.innerText || '').trim();
             const parentText = (el.parentElement ? el.parentElement.innerText : '').toLowerCase();
+            const nextText = (el.nextElementSibling ? el.nextElementSibling.innerText : '').toLowerCase();
             const selfText = text.toLowerCase();
-            const fullContext = selfText + ' ' + parentText;
+            const fullContext = selfText + ' ' + parentText + ' ' + nextText;
 
-            // Skip exchange offers & EMI installment notes
-            if (fullContext.includes('exchange')) continue;
-            if (fullContext.includes('/month') || fullContext.includes('per month') || fullContext.includes('emi') || /\bx\s*\d+\s*m\b/i.test(fullContext)) continue;
+            // Reject EMI or exchange fragments
+            const isEmi = fullContext.includes('/month') || fullContext.includes('per month') ||
+                          fullContext.includes('/m ') || fullContext.includes('/m\\n') ||
+                          fullContext.includes('no cost emi') || fullContext.includes('standard emi') ||
+                          /\bx\s*\d+\s*m\b/i.test(fullContext) ||
+                          fullContext.includes('exchange');
+            
+            if (isEmi) continue;
+            
+            allPrices.push(parsed);
+        }
 
-            if (text.startsWith('₹') && text.length <= 15) {
-                const parsed = cleanPrice(text);
-                if (parsed && parsed !== mrp && parsed !== wowPrice) {
-                    regularPrice = parsed;
-                    break;
+        // Deduplicate and sort descending
+        allPrices = [...new Set(allPrices)];
+        allPrices.sort((a, b) => b - a);
+
+        if (allPrices.length > 0) {
+            // The highest valid non-strikethrough price is the regular selling price
+            regularPrice = allPrices[0];
+            
+            // If there's a smaller valid price, it might be the WoW / Bank offer price
+            if (allPrices.length > 1) {
+                const lowestPrice = allPrices[allPrices.length - 1];
+                if (lowestPrice < regularPrice && lowestPrice >= (regularPrice * 0.55)) {
+                    wowPrice = lowestPrice;
                 }
             }
         }
@@ -673,12 +650,16 @@ async def _setup_data_saver_routes(context) -> None:
 
 
 # ── Flipkart Dead Laptop Exchange Auto-Setup ─────────────────────────────────
-EXCHANGE_SEED_URL = (
-    "https://www.flipkart.com/hp-omen-ai-amd-ryzen-7-octa-core-350-24-gb-1-tb-ssd-windows-11-home-8-gb-graphics-nvidia-geforce-rtx-5050-16-ap0165ax-gaming-laptop/p/itm5661c90728083?pid=COMHEHHXKFQSABXZ"
-)
+EXCHANGE_SEED_URLS = [
+    "https://www.flipkart.com/microsoft-surface-pro-12-type-cover-pen-core-8-365-6-months-snapdragon-x-plus-16-gb-512-gb-ssd-windows-11-home-ep2-27670-ep2-33040-laptop/p/itmf5e8efb329020?pid=COMHJZJYPUSC6XWX",
+    "https://www.flipkart.com/hp-omen-ai-amd-ryzen-7-octa-core-350-24-gb-1-tb-ssd-windows-11-home-8-gb-graphics-nvidia-geforce-rtx-5050-16-ap0165ax-gaming-laptop/p/itm5661c90728083?pid=COMHEHHXKFQSABXZ",
+    "https://www.flipkart.com/apple-2022-macbook-air-m2-8-gb-256-gb-ssd-mac-os-monterey-mly33hn-a/p/itm6ef914cbcc0c0?pid=COMGFB2GA7ZXXGZV",
+    "https://www.flipkart.com/asus-tuf-gaming-f15-core-i5-11th-gen-11400h-16-gb-512-gb-ssd-windows-11-home-4-graphics-nvidia-geforce-rtx-3050-144-hz-fx506hc-hn362w-laptop/p/itmdad28b8cfeb5c?pid=COMGS6UHWGGPWNZP",
+    "https://www.flipkart.com/hp-victus-intel-core-i5-12th-gen-12450h-16-gb-512-gb-ssd-windows-11-home-4-graphics-nvidia-geforce-rtx-3050-15-fa1313tx-gaming-laptop/p/itme9c8691f1ce1c?pid=COMGYYGZA9PGE9HY",
+]
 
 
-async def setup_dead_laptop_exchange(page: Page, pincode: str = "560001") -> bool:
+async def setup_dead_laptop_exchange(page: Page, seed_url: str, pincode: str = "560001") -> bool:
     """
     Initializes a dead / non-working laptop exchange on Flipkart.
     Navigates to a seed laptop with exchange enabled, sets delivery pincode,
@@ -686,9 +667,9 @@ async def setup_dead_laptop_exchange(page: Page, pincode: str = "560001") -> boo
     This binds the exchange bonus session to the browser context so all subsequent
     listing cards and product navigations benefit from active exchange discounts and bonuses.
     """
-    logger.info("🔄 Pre-loading dead laptop exchange into session (Pincode: %s)...", pincode)
+    logger.info("🔄 Pre-loading laptop exchange on seed URL (Pincode: %s)...", pincode)
     try:
-        await page.goto(EXCHANGE_SEED_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(seed_url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(2.5)
 
         # 1. Pincode entry
@@ -742,19 +723,68 @@ async def setup_dead_laptop_exchange(page: Page, pincode: str = "560001") -> boo
         }""")
         await asyncio.sleep(1.8)
 
-        # 4. Select Brand: 'Any - Laptop Not Working'
+        # 4. Select Brand & Condition (Try Dell 5th Gen first, fallback to Any - Laptop Not Working)
+        dell_opt = page.locator("text='Dell'").first
         dead_opt = page.locator("text='Any - Laptop Not Working'").first
-        if await dead_opt.count() > 0:
+        
+        if await dell_opt.count() > 0:
+            logger.info("Selecting Dell as exchange brand...")
+            await dell_opt.click()
+            await asyncio.sleep(1.0)
+            await page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('div, button, span')).find(e => (e.innerText || '').trim() === 'Next');
+                if (btn) btn.click();
+            }""")
+            await asyncio.sleep(1.5)
+            
+            # Try Core i5
+            proc_opt = page.locator("text='Core i5'").first
+            if await proc_opt.count() > 0:
+                await proc_opt.click()
+                await asyncio.sleep(1.0)
+                await page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('div, button, span')).find(e => (e.innerText || '').trim() === 'Next');
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(1.5)
+                
+            # Try 5th Gen
+            gen_opt = page.locator("text='5th Generation'").first
+            if await gen_opt.count() == 0:
+                gen_opt = page.locator("text='5th Gen'").first
+                
+            if await gen_opt.count() > 0:
+                await gen_opt.click()
+                await asyncio.sleep(1.0)
+                await page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('div, button, span')).find(e => (e.innerText || '').trim() === 'Next');
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(1.5)
+                
+            # Now we are at the condition questionnaire. Just keep clicking "Yes" (usually "Yes, it has scratches/dents", etc.) or "Next"
+            for _ in range(3):
+                yes_opt = page.locator("text='Yes'").first
+                if await yes_opt.count() > 0:
+                    await yes_opt.click()
+                    await asyncio.sleep(1.0)
+                await page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('div, button, span')).find(e => (e.innerText || '').trim() === 'Next');
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(1.5)
+                
+        elif await dead_opt.count() > 0:
+            logger.info("Dell not found, falling back to Any - Laptop Not Working...")
             await dead_opt.click()
             await asyncio.sleep(1.0)
-            # Click Next
             await page.evaluate("""() => {
                 const btn = Array.from(document.querySelectorAll('div, button, span')).find(e => (e.innerText || '').trim() === 'Next');
                 if (btn) btn.click();
             }""")
             await asyncio.sleep(1.8)
         else:
-            logger.warning("Could not find 'Any - Laptop Not Working' in exchange brand list.")
+            logger.warning("Could not find Dell or 'Any - Laptop Not Working' in exchange list.")
             return False
 
         # 5. Agree to Terms & Confirm Exchange
@@ -816,7 +846,7 @@ async def scrape_listing_mobile(
 
             exchange_cookies = []
             # Pre-load dead laptop exchange ONLY when apply_exchange is True (laptops only)
-            if apply_exchange:
+            if apply_exchange and EXCHANGE_SEED_URLS:
                 pincode = os.getenv("DEFAULT_PINCODE", "560001").strip()
                 desktop_ctx = await browser.new_context(
                     user_agent=random.choice(DESKTOP_USER_AGENTS),
@@ -827,10 +857,14 @@ async def scrape_listing_mobile(
                 await _setup_data_saver_routes(desktop_ctx)
                 desktop_page = await desktop_ctx.new_page()
                 try:
-                    ex_ok = await setup_dead_laptop_exchange(desktop_page, pincode=pincode)
-                    if ex_ok:
-                        exchange_cookies = await desktop_ctx.cookies()
-                        logger.info("🍪 Captured %d session cookies with active exchange bonus", len(exchange_cookies))
+                    for seed_url in EXCHANGE_SEED_URLS:
+                        ex_ok = await setup_dead_laptop_exchange(desktop_page, seed_url, pincode=pincode)
+                        if ex_ok:
+                            exchange_cookies = await desktop_ctx.cookies()
+                            logger.info("🍪 Captured %d session cookies with active exchange bonus from seed", len(exchange_cookies))
+                            break
+                        else:
+                            logger.info("⚠️ Seed URL %s failed to setup exchange, trying next fallback...", seed_url)
                 except Exception as e:
                     logger.warning("Exchange setup encountered issue: %s", e)
                 finally:
@@ -1576,8 +1610,10 @@ async def fetch_lenovo_outlet_laptops() -> list[dict]:
                     else:
                         url = raw_url or f"https://www.lenovo.com/in/outletin/en/p/{pcode}"
 
-                    # Stock check: purchaseFlag is True if buyable, marketingStatus == 'Available'
-                    in_stock = 1 if item.get("purchaseFlag", True) and item.get("marketingStatus") != "Out of stock" else 0
+                    # Stock check: purchaseFlag is True if buyable. We also strictly exclude "Out of stock" and "Available soon"
+                    mkt_status = (item.get("marketingStatus") or "").lower()
+                    is_buyable = bool(item.get("purchaseFlag", True))
+                    in_stock = 1 if is_buyable and "out of stock" not in mkt_status and "available soon" not in mkt_status else 0
 
                     laptop_dict = {
                         "product_code": pcode,
